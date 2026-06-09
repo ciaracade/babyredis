@@ -202,6 +202,142 @@ class TestStringOps:
         assert r.getdel("missing") is None
 
 
+class TestHashes:
+    def test_hset_hget(self, r):
+        assert r.hset("h", "f", "v") == 1
+        assert r.hget("h", "f") == b"v"
+        assert r.hget("h", "missing") is None
+        assert r.hget("missing", "f") is None
+
+    def test_hset_update_returns_zero(self, r):
+        r.hset("h", "f", "v1")
+        assert r.hset("h", "f", "v2") == 0
+        assert r.hget("h", "f") == b"v2"
+
+    def test_hset_mapping(self, r):
+        assert r.hset("h", mapping={"a": 1, "b": 2}) == 2
+        assert r.hset("h", "c", 3, mapping={"a": 9}) == 1
+        assert r.hget("h", "a") == b"9"
+
+    def test_hset_no_args_raises(self, r):
+        with pytest.raises(DataError):
+            r.hset("h")
+
+    def test_hgetall(self, r):
+        r.hset("h", mapping={"a": "1", "b": "2"})
+        assert r.hgetall("h") == {b"a": b"1", b"b": b"2"}
+        assert r.hgetall("missing") == {}
+
+    def test_hgetall_decode_responses(self, rd):
+        rd.hset("h", mapping={"a": "1"})
+        assert rd.hgetall("h") == {"a": "1"}
+
+    def test_hdel(self, r):
+        r.hset("h", mapping={"a": 1, "b": 2, "c": 3})
+        assert r.hdel("h", "a", "b", "missing") == 2
+        assert r.hlen("h") == 1
+        assert r.hdel("missing", "f") == 0
+
+    def test_hdel_last_field_removes_key(self, r):
+        r.hset("h", "f", "v")
+        r.hdel("h", "f")
+        assert r.exists("h") == 0
+        assert r.type("h") == b"none"
+
+    def test_hexists_hkeys_hvals_hlen(self, r):
+        r.hset("h", mapping={"a": "1", "b": "2"})
+        assert r.hexists("h", "a") is True
+        assert r.hexists("h", "z") is False
+        assert sorted(r.hkeys("h")) == [b"a", b"b"]
+        assert sorted(r.hvals("h")) == [b"1", b"2"]
+        assert r.hlen("h") == 2
+        assert r.hlen("missing") == 0
+
+    def test_hmget(self, r):
+        r.hset("h", mapping={"a": "1", "b": "2"})
+        assert r.hmget("h", "a", "z", "b") == [b"1", None, b"2"]
+        assert r.hmget("h", ["a", "b"]) == [b"1", b"2"]
+        assert r.hmget("missing", "a") == [None]
+
+    def test_hsetnx(self, r):
+        assert r.hsetnx("h", "f", "v1") is True
+        assert r.hsetnx("h", "f", "v2") is False
+        assert r.hget("h", "f") == b"v1"
+
+    def test_hincrby(self, r):
+        assert r.hincrby("h", "n") == 1
+        assert r.hincrby("h", "n", 10) == 11
+        assert r.hincrby("h", "n", -1) == 10
+        r.hset("h", "s", "text")
+        with pytest.raises(ResponseError):
+            r.hincrby("h", "s")
+
+    def test_hstrlen(self, r):
+        r.hset("h", "f", "hello")
+        assert r.hstrlen("h", "f") == 5
+        assert r.hstrlen("h", "missing") == 0
+
+    def test_hash_type_and_keys(self, r):
+        r.hset("h", "f", "v")
+        assert r.type("h") == b"hash"
+        assert r.keys() == [b"h"]
+        assert r.dbsize() == 1
+
+    def test_hash_ttl(self, r):
+        r.hset("h", "f", "v")
+        assert r.ttl("h") == -1
+        assert r.expire("h", 100) is True
+        assert 0 < r.ttl("h") <= 100
+        r.hset("gone", "f", "v")
+        r.pexpire("gone", 30)
+        time.sleep(0.05)
+        assert r.hgetall("gone") == {}
+        assert r.exists("gone") == 0
+
+    def test_hash_persists_across_reopen(self, tmp_path):
+        path = str(tmp_path / "h.db")
+        with BabyRedis(path) as r1:
+            r1.hset("h", mapping={"a": "1", "b": "2"})
+        with BabyRedis(path) as r2:
+            assert r2.hgetall("h") == {b"a": b"1", b"b": b"2"}
+
+
+class TestWrongType:
+    def test_string_ops_on_hash(self, r):
+        r.hset("h", "f", "v")
+        for op in (lambda: r.get("h"), lambda: r.incr("h"),
+                   lambda: r.append("h", "x"), lambda: r.strlen("h"),
+                   lambda: r.getdel("h"),
+                   lambda: r.set("h", "v", get=True)):
+            with pytest.raises(ResponseError):
+                op()
+
+    def test_hash_ops_on_string(self, r):
+        r.set("s", "v")
+        for op in (lambda: r.hget("s", "f"), lambda: r.hset("s", "f", "v"),
+                   lambda: r.hgetall("s"), lambda: r.hdel("s", "f"),
+                   lambda: r.hlen("s"), lambda: r.hincrby("s", "f")):
+            with pytest.raises(ResponseError):
+                op()
+
+    def test_set_overwrites_hash(self, r):
+        r.hset("k", "f", "v")
+        assert r.set("k", "now a string") is True
+        assert r.get("k") == b"now a string"
+        assert r.type("k") == b"string"
+
+    def test_mget_skips_wrong_type(self, r):
+        r.set("s", "v")
+        r.hset("h", "f", "v")
+        assert r.mget("s", "h") == [b"v", None]
+
+    def test_delete_works_on_any_type(self, r):
+        r.set("s", "v")
+        r.hset("h", "f", "v")
+        assert r.delete("s", "h") == 2
+        assert r.dbsize() == 0
+
+
 class TestServer:
     def test_dbsize_flushdb_ping(self, r):
         r.mset({"a": 1, "b": 2})
@@ -246,7 +382,7 @@ class TestServer:
         time.sleep(0.05)
         r.set("alive", "v")  # any write triggers the sweep
         (count,) = r._conn.execute(
-            "SELECT COUNT(*) FROM babyredis_kv"
+            "SELECT COUNT(*) FROM babyredis_keys"
         ).fetchone()
         assert count == 1
         r.close()

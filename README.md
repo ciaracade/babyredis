@@ -37,16 +37,22 @@ Redis will beat this on write throughput and tail latency, and there's no
 cross-machine networking. If you need pub/sub, clustering, or six-figure
 ops/sec, run real Redis. This is for everyone who doesn't.
 
-## Supported commands (v0.1)
+## Supported commands (v0.2)
 
-Strings and keys: `set`, `get`, `getset`, `getdel`, `setex`, `psetex`,
-`setnx`, `append`, `strlen`, `mset`, `mget`, `incr`/`incrby`,
-`decr`/`decrby`, `delete`, `exists`, `expire`, `pexpire`, `expireat`,
+**Strings:** `set`, `get`, `getset`, `getdel`, `setex`, `psetex`, `setnx`,
+`append`, `strlen`, `mset`, `mget`, `incr`/`incrby`, `decr`/`decrby`.
+
+**Hashes:** `hset` (with `mapping=`), `hget`, `hgetall`, `hdel`, `hexists`,
+`hkeys`, `hvals`, `hlen`, `hmget`, `hsetnx`, `hincrby`, `hstrlen`.
+
+**Keys & server:** `delete`, `exists`, `expire`, `pexpire`, `expireat`,
 `persist`, `ttl`, `pttl`, `keys` (Redis glob patterns), `type`, `dbsize`,
 `flushdb`, `ping`.
 
-Expired keys are invisible immediately and physically purged lazily
-(Redis-style), with a periodic sweep on writes.
+Semantics follow Redis: operations against a key of the wrong type raise
+`ResponseError` (WRONGTYPE), deleting a hash's last field removes the key,
+and TTLs apply per key across all types. Expired keys are invisible
+immediately and physically purged lazily, with a periodic sweep on writes.
 
 ## Install
 
@@ -56,8 +62,10 @@ pip install babyredis
 
 ## Roadmap
 
-- Hashes (`hset`/`hget`/...), lists, sets
-- `scan` iteration
+- Sets, sorted sets, lists
+- `pipeline()` (one SQLite transaction per pipeline — actually ACID)
+- `scan`/`hscan` iteration
+- Lock-free concurrent reads via thread-local connections
 - An optional pytest fixture for using babyredis as a test double
 
 ## Development
