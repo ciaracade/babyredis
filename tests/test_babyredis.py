@@ -302,6 +302,413 @@ class TestHashes:
             assert r2.hgetall("h") == {b"a": b"1", b"b": b"2"}
 
 
+class TestSets:
+    def test_sadd_smembers(self, r):
+        assert r.sadd("s", "a", "b", "c") == 3
+        assert r.sadd("s", "a", "d") == 1
+        assert r.smembers("s") == {b"a", b"b", b"c", b"d"}
+
+    def test_srem(self, r):
+        r.sadd("s", "a", "b", "c")
+        assert r.srem("s", "a", "b", "zz") == 2
+        assert r.smembers("s") == {b"c"}
+        assert r.srem("missing", "x") == 0
+
+    def test_srem_last_member_removes_key(self, r):
+        r.sadd("s", "a")
+        r.srem("s", "a")
+        assert r.exists("s") == 0
+
+    def test_sismember_scard(self, r):
+        r.sadd("s", "a", "b")
+        assert r.sismember("s", "a") is True
+        assert r.sismember("s", "z") is False
+        assert r.scard("s") == 2
+        assert r.scard("missing") == 0
+        assert r.smismember("s", ["a", "z"]) == [True, False]
+
+    def test_spop(self, r):
+        r.sadd("s", "a", "b", "c")
+        popped = r.spop("s")
+        assert popped in (b"a", b"b", b"c")
+        assert r.scard("s") == 2
+        rest = r.spop("s", 5)
+        assert len(rest) == 2
+        assert r.exists("s") == 0
+        assert r.spop("missing") is None
+        assert r.spop("missing", 2) == []
+
+    def test_srandmember(self, r):
+        r.sadd("s", "a", "b")
+        assert r.srandmember("s") in (b"a", b"b")
+        assert len(r.srandmember("s", 5)) == 2
+        assert len(r.srandmember("s", -5)) == 5
+        assert r.scard("s") == 2  # srandmember doesn't remove
+        assert r.srandmember("missing") is None
+
+    def test_smove(self, r):
+        r.sadd("src", "a", "b")
+        r.sadd("dst", "x")
+        assert r.smove("src", "dst", "a") is True
+        assert r.smembers("src") == {b"b"}
+        assert r.smembers("dst") == {b"a", b"x"}
+        assert r.smove("src", "dst", "zz") is False
+
+    def test_set_operations(self, r):
+        r.sadd("s1", "a", "b", "c")
+        r.sadd("s2", "b", "c", "d")
+        assert r.sinter("s1", "s2") == {b"b", b"c"}
+        assert r.sunion("s1", "s2") == {b"a", b"b", b"c", b"d"}
+        assert r.sdiff("s1", "s2") == {b"a"}
+        assert r.sinter(["s1", "s2"]) == {b"b", b"c"}
+        assert r.sinter("s1", "missing") == set()
+
+    def test_set_type_and_wrongtype(self, r):
+        r.sadd("s", "a")
+        assert r.type("s") == b"set"
+        with pytest.raises(ResponseError):
+            r.get("s")
+        r.set("str", "v")
+        with pytest.raises(ResponseError):
+            r.sadd("str", "a")
+
+    def test_sscan(self, r):
+        members = {f"m{i}" for i in range(25)}
+        r.sadd("s", *members)
+        collected = set(r.sscan_iter("s", count=7))
+        assert collected == {m.encode() for m in members}
+        assert set(r.sscan_iter("s", match="m1*", count=7)) == {
+            m.encode() for m in members if m.startswith("m1")}
+
+
+class TestSortedSets:
+    def test_zadd_zscore_zcard(self, r):
+        assert r.zadd("z", {"a": 1, "b": 2}) == 2
+        assert r.zadd("z", {"a": 5, "c": 3}) == 1
+        assert r.zscore("z", "a") == 5.0
+        assert r.zscore("z", "zz") is None
+        assert r.zcard("z") == 3
+        assert r.zmscore("z", ["a", "zz"]) == [5.0, None]
+
+    def test_zadd_nx_xx_ch(self, r):
+        r.zadd("z", {"a": 1})
+        assert r.zadd("z", {"a": 9, "b": 2}, nx=True) == 1
+        assert r.zscore("z", "a") == 1.0
+        assert r.zadd("z", {"a": 9, "c": 3}, xx=True) == 0
+        assert r.zscore("z", "a") == 9.0
+        assert r.zscore("z", "c") is None
+        assert r.zadd("z", {"a": 10, "d": 4}, ch=True) == 2
+
+    def test_zadd_gt_lt(self, r):
+        r.zadd("z", {"a": 5})
+        r.zadd("z", {"a": 3}, gt=True)
+        assert r.zscore("z", "a") == 5.0
+        r.zadd("z", {"a": 7}, gt=True)
+        assert r.zscore("z", "a") == 7.0
+        r.zadd("z", {"a": 2}, lt=True)
+        assert r.zscore("z", "a") == 2.0
+
+    def test_zincrby(self, r):
+        assert r.zincrby("z", 2.5, "a") == 2.5
+        assert r.zincrby("z", 1.5, "a") == 4.0
+
+    def test_zrem_removes_key_when_empty(self, r):
+        r.zadd("z", {"a": 1, "b": 2})
+        assert r.zrem("z", "a", "zz") == 1
+        assert r.zrem("z", "b") == 1
+        assert r.exists("z") == 0
+
+    def test_zrange(self, r):
+        r.zadd("z", {"a": 1, "b": 2, "c": 3})
+        assert r.zrange("z", 0, -1) == [b"a", b"b", b"c"]
+        assert r.zrange("z", 0, 1) == [b"a", b"b"]
+        assert r.zrange("z", -2, -1) == [b"b", b"c"]
+        assert r.zrevrange("z", 0, 0) == [b"c"]
+        assert r.zrange("z", 0, -1, withscores=True) == [
+            (b"a", 1.0), (b"b", 2.0), (b"c", 3.0)]
+        assert r.zrange("missing", 0, -1) == []
+
+    def test_zrangebyscore(self, r):
+        r.zadd("z", {"a": 1, "b": 2, "c": 3, "d": 4})
+        assert r.zrangebyscore("z", 2, 3) == [b"b", b"c"]
+        assert r.zrangebyscore("z", "(2", "+inf") == [b"c", b"d"]
+        assert r.zrangebyscore("z", "-inf", "+inf", start=1, num=2) == [
+            b"b", b"c"]
+        assert r.zrevrangebyscore("z", 3, 1) == [b"c", b"b", b"a"]
+        assert r.zcount("z", 2, "+inf") == 3
+
+    def test_zrank(self, r):
+        r.zadd("z", {"a": 1, "b": 2, "c": 3})
+        assert r.zrank("z", "a") == 0
+        assert r.zrank("z", "c") == 2
+        assert r.zrevrank("z", "c") == 0
+        assert r.zrank("z", "zz") is None
+        assert r.zrank("missing", "a") is None
+
+    def test_zpopmin_zpopmax(self, r):
+        r.zadd("z", {"a": 1, "b": 2, "c": 3})
+        assert r.zpopmin("z") == [(b"a", 1.0)]
+        assert r.zpopmax("z", 2) == [(b"c", 3.0), (b"b", 2.0)]
+        assert r.exists("z") == 0
+        assert r.zpopmin("missing") == []
+
+    def test_zset_type_and_wrongtype(self, r):
+        r.zadd("z", {"a": 1})
+        assert r.type("z") == b"zset"
+        with pytest.raises(ResponseError):
+            r.sadd("z", "x")
+
+    def test_zscan(self, r):
+        r.zadd("z", {f"m{i}": i for i in range(25)})
+        collected = dict(r.zscan_iter("z", count=7))
+        assert len(collected) == 25
+        assert collected[b"m13"] == 13.0
+
+
+class TestLists:
+    def test_push_pop_order(self, r):
+        r.rpush("l", "a", "b", "c")
+        assert r.lrange("l", 0, -1) == [b"a", b"b", b"c"]
+        r.lpush("l", "x", "y")  # y ends up leftmost
+        assert r.lrange("l", 0, -1) == [b"y", b"x", b"a", b"b", b"c"]
+        assert r.lpop("l") == b"y"
+        assert r.rpop("l") == b"c"
+        assert r.lrange("l", 0, -1) == [b"x", b"a", b"b"]
+
+    def test_pop_count(self, r):
+        r.rpush("l", "a", "b", "c")
+        assert r.lpop("l", 2) == [b"a", b"b"]
+        assert r.rpop("l", 5) == [b"c"]
+        assert r.exists("l") == 0
+        assert r.lpop("missing") is None
+        assert r.lpop("missing", 2) is None
+
+    def test_llen_lindex(self, r):
+        r.rpush("l", "a", "b", "c")
+        assert r.llen("l") == 3
+        assert r.llen("missing") == 0
+        assert r.lindex("l", 0) == b"a"
+        assert r.lindex("l", -1) == b"c"
+        assert r.lindex("l", 9) is None
+
+    def test_lrange_negative_indices(self, r):
+        r.rpush("l", *"abcde")
+        assert r.lrange("l", 1, 3) == [b"b", b"c", b"d"]
+        assert r.lrange("l", -2, -1) == [b"d", b"e"]
+        assert r.lrange("l", 3, 1) == []
+        assert r.lrange("missing", 0, -1) == []
+
+    def test_lset(self, r):
+        r.rpush("l", "a", "b", "c")
+        assert r.lset("l", 1, "B") is True
+        assert r.lset("l", -1, "C") is True
+        assert r.lrange("l", 0, -1) == [b"a", b"B", b"C"]
+        with pytest.raises(ResponseError):
+            r.lset("l", 9, "x")
+        with pytest.raises(ResponseError):
+            r.lset("missing", 0, "x")
+
+    def test_lrem(self, r):
+        r.rpush("l", "a", "b", "a", "c", "a")
+        assert r.lrem("l", 2, "a") == 2
+        assert r.lrange("l", 0, -1) == [b"b", b"c", b"a"]
+        r.rpush("l", "a")
+        assert r.lrem("l", -1, "a") == 1
+        assert r.lrange("l", 0, -1) == [b"b", b"c", b"a"]
+        assert r.lrem("l", 0, "a") == 1
+        assert r.lrem("missing", 0, "x") == 0
+
+    def test_ltrim(self, r):
+        r.rpush("l", *"abcde")
+        assert r.ltrim("l", 1, 3) is True
+        assert r.lrange("l", 0, -1) == [b"b", b"c", b"d"]
+        r.ltrim("l", 5, 9)  # keeps nothing
+        assert r.exists("l") == 0
+
+    def test_linsert(self, r):
+        r.rpush("l", "a", "c")
+        assert r.linsert("l", "before", "c", "b") == 3
+        assert r.linsert("l", "after", "c", "d") == 4
+        assert r.lrange("l", 0, -1) == [b"a", b"b", b"c", b"d"]
+        assert r.linsert("l", "before", "zz", "x") == -1
+        assert r.linsert("missing", "before", "a", "x") == 0
+
+    def test_linsert_many_times_same_spot(self, r):
+        # repeatedly bisecting the same gap exhausts float precision and
+        # forces a renumber; order must survive
+        r.rpush("l", "start", "end")
+        for i in range(80):
+            assert r.linsert("l", "after", "start", str(i)) == i + 3
+        items = r.lrange("l", 0, -1)
+        assert items[0] == b"start"
+        assert items[-1] == b"end"
+        assert items[1] == b"79"
+        assert len(items) == 82
+
+    def test_list_type_and_wrongtype(self, r):
+        r.rpush("l", "a")
+        assert r.type("l") == b"list"
+        with pytest.raises(ResponseError):
+            r.get("l")
+        r.set("s", "v")
+        with pytest.raises(ResponseError):
+            r.rpush("s", "a")
+
+    def test_list_persists_across_reopen(self, tmp_path):
+        path = str(tmp_path / "l.db")
+        with BabyRedis(path) as r1:
+            r1.rpush("l", "a", "b", "c")
+        with BabyRedis(path) as r2:
+            assert r2.lrange("l", 0, -1) == [b"a", b"b", b"c"]
+
+
+class TestPipeline:
+    def test_pipeline_executes_in_order(self, r):
+        with r.pipeline() as pipe:
+            pipe.set("a", "1").incr("n").rpush("l", "x", "y")
+            assert len(pipe) == 3
+            results = pipe.execute()
+        assert results == [True, 1, 2]
+        assert r.get("a") == b"1"
+
+    def test_pipeline_is_atomic_on_error(self, r):
+        r.set("s", "not a number")
+        pipe = r.pipeline()
+        pipe.set("a", "1")
+        pipe.incr("s")  # will raise ResponseError
+        pipe.set("b", "2")
+        with pytest.raises(ResponseError):
+            pipe.execute()
+        # the whole batch rolled back, including the first set
+        assert r.get("a") is None
+        assert r.get("b") is None
+
+    def test_pipeline_raise_on_error_false(self, r):
+        r.set("s", "not a number")
+        pipe = r.pipeline()
+        pipe.set("a", "1")
+        pipe.incr("s")
+        results = pipe.execute(raise_on_error=False)
+        assert results[0] is True
+        assert isinstance(results[1], ResponseError)
+        assert r.get("a") == b"1"
+
+    def test_pipeline_resets_after_execute(self, r):
+        pipe = r.pipeline()
+        pipe.set("a", "1")
+        pipe.execute()
+        assert len(pipe) == 0
+        assert pipe.execute() == []
+
+
+class TestScan:
+    def test_scan_iterates_everything(self, r):
+        for i in range(25):
+            r.set(f"k{i}", i)
+        assert set(r.scan_iter(count=7)) == {f"k{i}".encode()
+                                             for i in range(25)}
+
+    def test_scan_match(self, r):
+        r.mset({"user:1": "a", "user:2": "b", "order:1": "c"})
+        assert set(r.scan_iter(match="user:*")) == {b"user:1", b"user:2"}
+
+    def test_scan_cursor_protocol(self, r):
+        for i in range(5):
+            r.set(f"k{i}", i)
+        cursor, page = r.scan(0, count=2)
+        assert cursor != 0 and len(page) == 2
+        cursor2, page2 = r.scan(cursor, count=10)
+        assert cursor2 == 0
+        assert len(page) + len(page2) == 5
+
+    def test_scan_skips_expired(self, r):
+        r.set("dead", "v", px=20)
+        r.set("alive", "v")
+        time.sleep(0.05)
+        assert list(r.scan_iter()) == [b"alive"]
+
+    def test_hscan(self, r):
+        r.hset("h", mapping={f"f{i}": i for i in range(25)})
+        collected = dict(r.hscan_iter("h", count=7))
+        assert len(collected) == 25
+        assert collected[b"f3"] == b"3"
+        matched = dict(r.hscan_iter("h", match="f1?", count=7))
+        assert set(matched) == {f"f1{i}".encode() for i in range(10)}
+
+
+class TestRename:
+    def test_rename(self, r):
+        r.set("a", "v", ex=100)
+        assert r.rename("a", "b") is True
+        assert r.get("b") == b"v"
+        assert 0 < r.ttl("b") <= 100
+        assert r.exists("a") == 0
+
+    def test_rename_overwrites_dst(self, r):
+        r.set("a", "v1")
+        r.hset("b", "f", "v")
+        r.rename("a", "b")
+        assert r.get("b") == b"v1"
+
+    def test_rename_missing_raises(self, r):
+        with pytest.raises(ResponseError):
+            r.rename("missing", "b")
+
+
+class TestConcurrency:
+    def test_concurrent_reads_during_write(self, r):
+        r.set("k", "v")
+        errors = []
+
+        def reader():
+            try:
+                for _ in range(200):
+                    assert r.get("k") is not None
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def writer():
+            try:
+                for i in range(200):
+                    r.set("k", f"v{i}")
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        threads.append(threading.Thread(target=writer))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+
+    def test_pipeline_not_visible_to_other_threads_midway(self, r):
+        # a pipeline's writes land atomically: either none or all
+        done = threading.Event()
+        seen = []
+
+        def observer():
+            while not done.is_set():
+                a, b = r.mget("pa", "pb")
+                seen.append((a is None, b is None))
+        t = threading.Thread(target=observer)
+        t.start()
+        pipe = r.pipeline()
+        pipe.set("pa", "1")
+        pipe.set("pb", "2")
+        pipe.execute()
+        done.set()
+        t.join()
+        # never observe pa set while pb is missing
+        assert (False, True) not in seen
+
+
+class TestFixtures:
+    def test_fixture_module_provides_clients(self, tmp_path):
+        from babyredis.testing import babyredis_client  # noqa: F401
+        from babyredis.testing import babyredis_client_decoded  # noqa: F401
+
+
 class TestWrongType:
     def test_string_ops_on_hash(self, r):
         r.hset("h", "f", "v")
@@ -381,7 +788,7 @@ class TestServer:
         r.set("dead", "v", px=20)
         time.sleep(0.05)
         r.set("alive", "v")  # any write triggers the sweep
-        (count,) = r._conn.execute(
+        (count,) = r._get_conn().execute(
             "SELECT COUNT(*) FROM babyredis_keys"
         ).fetchone()
         assert count == 1
