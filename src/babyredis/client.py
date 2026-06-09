@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS babyredis_keys (
   id INTEGER PRIMARY KEY,
   key TEXT NOT NULL UNIQUE,
   type TEXT NOT NULL,
-  expires_at REAL
+  expires_at REAL,
+  size INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS babyredis_keys_expires
   ON babyredis_keys(expires_at) WHERE expires_at IS NOT NULL;
@@ -191,6 +192,21 @@ class BabyRedis:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_SCHEMA)
+        try:
+            conn.execute(
+                "ALTER TABLE babyredis_keys"
+                " ADD COLUMN size INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists (fresh schema or migrated)
+        else:
+            # backfill element counts for pre-size-tracking databases
+            for type_, table in _CHILD_TABLE.items():
+                conn.execute(
+                    f"UPDATE babyredis_keys SET size = (SELECT COUNT(*)"
+                    f" FROM {table} WHERE key_id = babyredis_keys.id)"
+                    f" WHERE type = ?", (type_,)
+                )
         with self._conns_lock:
             self._conns.append(conn)
         return conn
@@ -277,9 +293,10 @@ class BabyRedis:
             )
 
     def _lookup(self, conn, key, now):
-        """Return (id, type, expires_at) honoring expiry, or None if missing."""
+        """Return (id, type, expires_at, size) honoring expiry, or None."""
         row = conn.execute(
-            "SELECT id, type, expires_at FROM babyredis_keys WHERE key = ?",
+            "SELECT id, type, expires_at, size FROM babyredis_keys"
+            " WHERE key = ?",
             (key,),
         ).fetchone()
         if row is None:
@@ -295,22 +312,26 @@ class BabyRedis:
             raise ResponseError(_WRONGTYPE)
         return row
 
-    def _create_key(self, conn, key, type_, expires_at):
+    def _create_key(self, conn, key, type_, expires_at, size=0):
         cur = conn.execute(
-            "INSERT INTO babyredis_keys (key, type, expires_at)"
-            " VALUES (?, ?, ?)",
-            (key, type_, expires_at),
+            "INSERT INTO babyredis_keys (key, type, expires_at, size)"
+            " VALUES (?, ?, ?, ?)",
+            (key, type_, expires_at, size),
         )
         return cur.lastrowid
 
-    def _drop_if_empty(self, conn, key_id, type_):
-        table = _CHILD_TABLE[type_]
-        (count,) = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE key_id = ?", (key_id,)
+    def _adjust_size(self, conn, key_id, delta):
+        conn.execute(
+            "UPDATE babyredis_keys SET size = size + ? WHERE id = ?",
+            (delta, key_id),
+        )
+
+    def _drop_if_empty(self, conn, key_id):
+        (size,) = conn.execute(
+            "SELECT size FROM babyredis_keys WHERE id = ?", (key_id,)
         ).fetchone()
-        if count == 0:
+        if size <= 0:
             conn.execute("DELETE FROM babyredis_keys WHERE id = ?", (key_id,))
-        return count
 
     # -- strings ----------------------------------------------------------
 
@@ -535,6 +556,8 @@ class BabyRedis:
                         (key_id, field, data),
                     )
                     added += 1
+            if added:
+                self._adjust_size(conn, key_id, added)
         return added
 
     def hget(self, name, key):
@@ -581,7 +604,9 @@ class BabyRedis:
                     (row[0], field),
                 )
                 count += cur.rowcount
-            self._drop_if_empty(conn, row[0], "hash")
+            if count:
+                self._adjust_size(conn, row[0], -count)
+            self._drop_if_empty(conn, row[0])
         return count
 
     def hexists(self, name, key):
@@ -626,13 +651,7 @@ class BabyRedis:
         name_key = self._encode_key(name)
         with self._read() as conn:
             row = self._typed_lookup(conn, name_key, time.time(), "hash")
-            if row is None:
-                return 0
-            (count,) = conn.execute(
-                "SELECT COUNT(*) FROM babyredis_hashes WHERE key_id = ?",
-                (row[0],),
-            ).fetchone()
-        return count
+        return row[3] if row else 0
 
     def hmget(self, name, keys, *args):
         if isinstance(keys, (str, bytes)):
@@ -668,6 +687,8 @@ class BabyRedis:
                 " VALUES (?, ?, ?) ON CONFLICT(key_id, field) DO NOTHING",
                 (key_id, field, data),
             )
+            if cur.rowcount == 1:
+                self._adjust_size(conn, key_id, 1)
         return cur.rowcount == 1
 
     def hincrby(self, name, key, amount=1):
@@ -701,6 +722,8 @@ class BabyRedis:
                 " ON CONFLICT(key_id, field) DO UPDATE SET value=excluded.value",
                 (key_id, field, str(new).encode("ascii")),
             )
+            if got is None:
+                self._adjust_size(conn, key_id, 1)
         return new
 
     def hincrbyfloat(self, name, key, amount=1.0):
@@ -732,6 +755,8 @@ class BabyRedis:
                 " ON CONFLICT(key_id, field) DO UPDATE SET value=excluded.value",
                 (key_id, field, self._format_float(new).encode("ascii")),
             )
+            if got is None:
+                self._adjust_size(conn, key_id, 1)
         return new
 
     def hstrlen(self, name, key):
@@ -790,6 +815,8 @@ class BabyRedis:
                     (key_id, member),
                 )
                 added += cur.rowcount
+            if added:
+                self._adjust_size(conn, key_id, added)
         return added
 
     def srem(self, name, *values):
@@ -808,7 +835,9 @@ class BabyRedis:
                     (row[0], member),
                 )
                 count += cur.rowcount
-            self._drop_if_empty(conn, row[0], "set")
+            if count:
+                self._adjust_size(conn, row[0], -count)
+            self._drop_if_empty(conn, row[0])
         return count
 
     def _set_members(self, conn, name, now):
@@ -842,13 +871,7 @@ class BabyRedis:
         name_key = self._encode_key(name)
         with self._read() as conn:
             row = self._typed_lookup(conn, name_key, time.time(), "set")
-            if row is None:
-                return 0
-            (count,) = conn.execute(
-                "SELECT COUNT(*) FROM babyredis_sets WHERE key_id = ?",
-                (row[0],),
-            ).fetchone()
-        return count
+        return row[3] if row else 0
 
     def spop(self, name, count=None):
         name_key = self._encode_key(name)
@@ -870,7 +893,9 @@ class BabyRedis:
                     " WHERE key_id = ? AND member = ?",
                     (row[0], member),
                 )
-            self._drop_if_empty(conn, row[0], "set")
+            if popped:
+                self._adjust_size(conn, row[0], -len(popped))
+            self._drop_if_empty(conn, row[0])
         if count is None:
             return self._decode(popped[0]) if popped else None
         return [self._decode(m) for m in popped]
@@ -904,14 +929,17 @@ class BabyRedis:
             )
             if cur.rowcount == 0:
                 return False
+            self._adjust_size(conn, src_row[0], -1)
             dst_id = dst_row[0] if dst_row else self._create_key(
                 conn, self._encode_key(dst), "set", None)
-            conn.execute(
+            ins = conn.execute(
                 "INSERT INTO babyredis_sets (key_id, member) VALUES (?, ?)"
                 " ON CONFLICT(key_id, member) DO NOTHING",
                 (dst_id, member),
             )
-            self._drop_if_empty(conn, src_row[0], "set")
+            if ins.rowcount:
+                self._adjust_size(conn, dst_id, 1)
+            self._drop_if_empty(conn, src_row[0])
         return True
 
     def _set_op(self, op, keys, args):
@@ -957,7 +985,8 @@ class BabyRedis:
                     "DELETE FROM babyredis_keys WHERE id = ?", (dest_row[0],)
                 )
             if result:  # like Redis, an empty result deletes dest
-                key_id = self._create_key(conn, dest_key, "set", None)
+                key_id = self._create_key(conn, dest_key, "set", None,
+                                          size=len(result))
                 for member in result:
                     conn.execute(
                         "INSERT INTO babyredis_sets (key_id, member)"
@@ -1064,6 +1093,8 @@ class BabyRedis:
                         )
                         changed += 1
                     incr_result = new
+            if added and key_id is not None:
+                self._adjust_size(conn, key_id, added)
         if incr:
             return incr_result
         return changed if ch else added
@@ -1104,20 +1135,16 @@ class BabyRedis:
                     (row[0], member),
                 )
                 count += cur.rowcount
-            self._drop_if_empty(conn, row[0], "zset")
+            if count:
+                self._adjust_size(conn, row[0], -count)
+            self._drop_if_empty(conn, row[0])
         return count
 
     def zcard(self, name):
         name_key = self._encode_key(name)
         with self._read() as conn:
             row = self._typed_lookup(conn, name_key, time.time(), "zset")
-            if row is None:
-                return 0
-            (count,) = conn.execute(
-                "SELECT COUNT(*) FROM babyredis_zsets WHERE key_id = ?",
-                (row[0],),
-            ).fetchone()
-        return count
+        return row[3] if row else 0
 
     @staticmethod
     def _score_where(min_, max_):
@@ -1146,10 +1173,7 @@ class BabyRedis:
             ).fetchone()
         return count
 
-    def _zrange_rows(self, conn, key_id, start, end, desc):
-        (total,) = conn.execute(
-            "SELECT COUNT(*) FROM babyredis_zsets WHERE key_id = ?", (key_id,)
-        ).fetchone()
+    def _zrange_rows(self, conn, key_id, total, start, end, desc):
         if start < 0:
             start = max(total + start, 0)
         if end < 0:
@@ -1175,7 +1199,7 @@ class BabyRedis:
             row = self._typed_lookup(conn, name_key, time.time(), "zset")
             if row is None:
                 return []
-            rows = self._zrange_rows(conn, row[0], start, end, desc)
+            rows = self._zrange_rows(conn, row[0], row[3], start, end, desc)
         return self._zformat(rows, withscores)
 
     def zrevrange(self, name, start, end, withscores=False):
@@ -1265,7 +1289,9 @@ class BabyRedis:
                     " WHERE key_id = ? AND member = ?",
                     (row[0], bytes(member)),
                 )
-            self._drop_if_empty(conn, row[0], "zset")
+            if rows:
+                self._adjust_size(conn, row[0], -len(rows))
+            self._drop_if_empty(conn, row[0])
         return [(self._decode(bytes(m)), float(s)) for m, s in rows]
 
     def zpopmin(self, name, count=None):
@@ -1281,14 +1307,17 @@ class BabyRedis:
             row = self._typed_lookup(conn, name_key, now, "zset")
             if row is None:
                 return 0
-            rows = self._zrange_rows(conn, row[0], min, max, desc=False)
+            rows = self._zrange_rows(conn, row[0], row[3], min, max,
+                                     desc=False)
             for member, _ in rows:
                 conn.execute(
                     "DELETE FROM babyredis_zsets"
                     " WHERE key_id = ? AND member = ?",
                     (row[0], bytes(member)),
                 )
-            self._drop_if_empty(conn, row[0], "zset")
+            if rows:
+                self._adjust_size(conn, row[0], -len(rows))
+            self._drop_if_empty(conn, row[0])
         return len(rows)
 
     def zremrangebyscore(self, name, min, max):
@@ -1304,7 +1333,9 @@ class BabyRedis:
                 [row[0]] + params,
             )
             removed = cur.rowcount
-            self._drop_if_empty(conn, row[0], "zset")
+            if removed:
+                self._adjust_size(conn, row[0], -removed)
+            self._drop_if_empty(conn, row[0])
         return removed
 
     def _zset_or_set_scores(self, conn, name, now):
@@ -1367,7 +1398,8 @@ class BabyRedis:
                     "DELETE FROM babyredis_keys WHERE id = ?", (dest_row[0],)
                 )
             if result:
-                key_id = self._create_key(conn, dest_key, "zset", None)
+                key_id = self._create_key(conn, dest_key, "zset", None,
+                                          size=len(result))
                 for member, score in result.items():
                     conn.execute(
                         "INSERT INTO babyredis_zsets (key_id, member, score)"
@@ -1417,10 +1449,17 @@ class BabyRedis:
     # -- lists ----------------------------------------------------------------
 
     def _list_bounds(self, conn, key_id):
-        return conn.execute(
-            "SELECT MIN(pos), MAX(pos) FROM babyredis_lists WHERE key_id = ?",
+        # two queries: SQLite's min/max index optimization only kicks in
+        # for a lone MIN() or MAX(), not both in one SELECT
+        (lo,) = conn.execute(
+            "SELECT MIN(pos) FROM babyredis_lists WHERE key_id = ?",
             (key_id,),
         ).fetchone()
+        (hi,) = conn.execute(
+            "SELECT MAX(pos) FROM babyredis_lists WHERE key_id = ?",
+            (key_id,),
+        ).fetchone()
+        return lo, hi
 
     def _list_renumber(self, conn, key_id):
         rows = conn.execute(
@@ -1463,11 +1502,8 @@ class BabyRedis:
                     " VALUES (?, ?, ?)",
                     (key_id, pos, value),
                 )
-            (length,) = conn.execute(
-                "SELECT COUNT(*) FROM babyredis_lists WHERE key_id = ?",
-                (key_id,),
-            ).fetchone()
-        return length
+            self._adjust_size(conn, key_id, len(items))
+        return (row[3] if row else 0) + len(items)
 
     def lpush(self, name, *values):
         return self._push(name, values, left=True)
@@ -1495,7 +1531,9 @@ class BabyRedis:
                     " WHERE key_id = ? AND pos = ?",
                     (row[0], pos),
                 )
-            self._drop_if_empty(conn, row[0], "list")
+            if rows:
+                self._adjust_size(conn, row[0], -len(rows))
+            self._drop_if_empty(conn, row[0])
         values = [self._decode(bytes(v)) for _, v in rows]
         if count is None:
             return values[0] if values else None
@@ -1511,18 +1549,10 @@ class BabyRedis:
         name_key = self._encode_key(name)
         with self._read() as conn:
             row = self._typed_lookup(conn, name_key, time.time(), "list")
-            if row is None:
-                return 0
-            (count,) = conn.execute(
-                "SELECT COUNT(*) FROM babyredis_lists WHERE key_id = ?",
-                (row[0],),
-            ).fetchone()
-        return count
+        return row[3] if row else 0
 
-    def _range_window(self, conn, key_id, start, end):
-        (total,) = conn.execute(
-            "SELECT COUNT(*) FROM babyredis_lists WHERE key_id = ?", (key_id,)
-        ).fetchone()
+    @staticmethod
+    def _range_window(total, start, end):
         if start < 0:
             start = max(total + start, 0)
         if end < 0:
@@ -1537,7 +1567,7 @@ class BabyRedis:
             row = self._typed_lookup(conn, name_key, time.time(), "list")
             if row is None:
                 return []
-            lo, hi, _ = self._range_window(conn, row[0], start, end)
+            lo, hi, _ = self._range_window(row[3], start, end)
             if lo is None:
                 return []
             rows = conn.execute(
@@ -1553,7 +1583,7 @@ class BabyRedis:
             row = self._typed_lookup(conn, name_key, time.time(), "list")
             if row is None:
                 return None
-            lo, hi, _ = self._range_window(conn, row[0], index, index)
+            lo, hi, _ = self._range_window(row[3], index, index)
             if lo is None:
                 return None
             got = conn.execute(
@@ -1571,7 +1601,7 @@ class BabyRedis:
             row = self._typed_lookup(conn, name_key, now, "list")
             if row is None:
                 raise ResponseError("no such key")
-            lo, _, total = self._range_window(conn, row[0], index, index)
+            lo, _, total = self._range_window(row[3], index, index)
             if lo is None:
                 raise ResponseError("index out of range")
             got = conn.execute(
@@ -1608,7 +1638,9 @@ class BabyRedis:
                     " WHERE key_id = ? AND pos = ?",
                     (row[0], pos),
                 )
-            self._drop_if_empty(conn, row[0], "list")
+            if rows:
+                self._adjust_size(conn, row[0], -len(rows))
+            self._drop_if_empty(conn, row[0])
         return len(rows)
 
     def ltrim(self, name, start, end):
@@ -1618,7 +1650,7 @@ class BabyRedis:
             row = self._typed_lookup(conn, name_key, now, "list")
             if row is None:
                 return True
-            lo, hi, total = self._range_window(conn, row[0], start, end)
+            lo, hi, total = self._range_window(row[3], start, end)
             if lo is None:  # nothing kept: empty list means delete the key
                 conn.execute(
                     "DELETE FROM babyredis_keys WHERE id = ?", (row[0],)
@@ -1634,6 +1666,10 @@ class BabyRedis:
                 "DELETE FROM babyredis_lists"
                 " WHERE key_id = ? AND (pos < ? OR pos > ?)",
                 (row[0], lo_pos, hi_pos),
+            )
+            conn.execute(
+                "UPDATE babyredis_keys SET size = ? WHERE id = ?",
+                (len(keep), row[0]),
             )
         return True
 
@@ -1679,13 +1715,10 @@ class BabyRedis:
                         " VALUES (?, ?, ?)",
                         (row[0], new_pos, data),
                     )
+                    self._adjust_size(conn, row[0], 1)
                     break
                 self._list_renumber(conn, row[0])  # float precision exhausted
-            (length,) = conn.execute(
-                "SELECT COUNT(*) FROM babyredis_lists WHERE key_id = ?",
-                (row[0],),
-            ).fetchone()
-        return length
+        return row[3] + 1
 
     def lmove(self, first_list, second_list, src="LEFT", dest="RIGHT"):
         src, dest = src.upper(), dest.upper()
@@ -1724,7 +1757,9 @@ class BabyRedis:
                 (dst_id, new_pos, bytes(value)),
             )
             if src_row[0] != dst_id:
-                self._drop_if_empty(conn, src_row[0], "list")
+                self._adjust_size(conn, src_row[0], -1)
+                self._adjust_size(conn, dst_id, 1)
+                self._drop_if_empty(conn, src_row[0])
         return self._decode(bytes(value))
 
     def rpoplpush(self, src, dst):
