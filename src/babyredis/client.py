@@ -477,6 +477,32 @@ class BabyRedis:
 
     decr = decrby
 
+    @staticmethod
+    def _format_float(value):
+        # Redis strips a trailing ".0" from float results
+        s = repr(value)
+        return s[:-2] if s.endswith(".0") else s
+
+    def incrbyfloat(self, name, amount=1.0):
+        key = self._encode_key(name)
+        now = time.time()
+        with self._write() as conn:
+            row = self._typed_lookup(conn, key, now, "string")
+            if row is None:
+                current = 0.0
+            else:
+                try:
+                    current = float(self._string_value(conn, row[0]))
+                except ValueError:
+                    raise ResponseError(
+                        "value is not a valid float"
+                    ) from None
+            new = current + float(amount)
+            self._put_string(conn, key, row,
+                             self._format_float(new).encode("ascii"),
+                             row[2] if row else None)
+        return new
+
     # -- hashes -----------------------------------------------------------
 
     def hset(self, name, key=None, value=None, mapping=None):
@@ -538,6 +564,8 @@ class BabyRedis:
         return {self._decode_field(f): self._decode(v) for f, v in rows}
 
     def hdel(self, name, *keys):
+        if not keys:
+            raise DataError("'hdel' with no fields")
         name_key = self._encode_key(name)
         fields = [self._encode_key(k) for k in keys]
         now = time.time()
@@ -672,6 +700,37 @@ class BabyRedis:
                 " VALUES (?, ?, ?)"
                 " ON CONFLICT(key_id, field) DO UPDATE SET value=excluded.value",
                 (key_id, field, str(new).encode("ascii")),
+            )
+        return new
+
+    def hincrbyfloat(self, name, key, amount=1.0):
+        name_key = self._encode_key(name)
+        field = self._encode_key(key)
+        now = time.time()
+        with self._write() as conn:
+            row = self._typed_lookup(conn, name_key, now, "hash")
+            key_id = row[0] if row else self._create_key(
+                conn, name_key, "hash", None)
+            got = conn.execute(
+                "SELECT value FROM babyredis_hashes"
+                " WHERE key_id = ? AND field = ?",
+                (key_id, field),
+            ).fetchone()
+            if got is None:
+                current = 0.0
+            else:
+                try:
+                    current = float(bytes(got[0]))
+                except ValueError:
+                    raise ResponseError(
+                        "hash value is not a float"
+                    ) from None
+            new = current + float(amount)
+            conn.execute(
+                "INSERT INTO babyredis_hashes (key_id, field, value)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(key_id, field) DO UPDATE SET value=excluded.value",
+                (key_id, field, self._format_float(new).encode("ascii")),
             )
         return new
 
@@ -878,6 +937,41 @@ class BabyRedis:
 
     def smismember(self, name, values):
         return [self.sismember(name, v) for v in values]
+
+    def _set_store(self, op, dest, keys, args):
+        if isinstance(keys, (str, bytes)):
+            keys = [keys]
+        names = list(keys) + list(args)
+        dest_key = self._encode_key(dest)
+        now = time.time()
+        with self._write() as conn:
+            sets = [self._set_members(conn, name, now) for name in names]
+            result = sets[0] if sets else set()
+            for other in sets[1:]:
+                result = op(result, other)
+            dest_row = self._lookup(conn, dest_key, now)
+            if dest_row is not None:
+                conn.execute(
+                    "DELETE FROM babyredis_keys WHERE id = ?", (dest_row[0],)
+                )
+            if result:  # like Redis, an empty result deletes dest
+                key_id = self._create_key(conn, dest_key, "set", None)
+                for member in result:
+                    conn.execute(
+                        "INSERT INTO babyredis_sets (key_id, member)"
+                        " VALUES (?, ?)",
+                        (key_id, member),
+                    )
+        return len(result)
+
+    def sinterstore(self, dest, keys, *args):
+        return self._set_store(set.intersection, dest, keys, args)
+
+    def sunionstore(self, dest, keys, *args):
+        return self._set_store(set.union, dest, keys, args)
+
+    def sdiffstore(self, dest, keys, *args):
+        return self._set_store(set.difference, dest, keys, args)
 
     def sscan(self, name, cursor=0, match=None, count=10):
         name_key = self._encode_key(name)
@@ -1177,6 +1271,114 @@ class BabyRedis:
 
     def zpopmax(self, name, count=None):
         return self._zpop(name, count, desc=True)
+
+    def zremrangebyrank(self, name, min, max):
+        name_key = self._encode_key(name)
+        now = time.time()
+        with self._write() as conn:
+            row = self._typed_lookup(conn, name_key, now, "zset")
+            if row is None:
+                return 0
+            rows = self._zrange_rows(conn, row[0], min, max, desc=False)
+            for member, _ in rows:
+                conn.execute(
+                    "DELETE FROM babyredis_zsets"
+                    " WHERE key_id = ? AND member = ?",
+                    (row[0], bytes(member)),
+                )
+            self._drop_if_empty(conn, row[0], "zset")
+        return len(rows)
+
+    def zremrangebyscore(self, name, min, max):
+        name_key = self._encode_key(name)
+        where, params = self._score_where(min, max)
+        now = time.time()
+        with self._write() as conn:
+            row = self._typed_lookup(conn, name_key, now, "zset")
+            if row is None:
+                return 0
+            cur = conn.execute(
+                f"DELETE FROM babyredis_zsets WHERE key_id = ?{where}",
+                [row[0]] + params,
+            )
+            removed = cur.rowcount
+            self._drop_if_empty(conn, row[0], "zset")
+        return removed
+
+    def _zset_or_set_scores(self, conn, name, now):
+        """Member->score map; plain sets count as score 1.0 (like Redis)."""
+        row = self._lookup(conn, self._encode_key(name), now)
+        if row is None:
+            return None
+        if row[1] == "zset":
+            rows = conn.execute(
+                "SELECT member, score FROM babyredis_zsets WHERE key_id = ?",
+                (row[0],),
+            ).fetchall()
+            return {bytes(m): float(s) for m, s in rows}
+        if row[1] == "set":
+            rows = conn.execute(
+                "SELECT member FROM babyredis_sets WHERE key_id = ?",
+                (row[0],),
+            ).fetchall()
+            return {bytes(m): 1.0 for (m,) in rows}
+        raise ResponseError(_WRONGTYPE)
+
+    def _zstore(self, dest, keys, aggregate, inter):
+        if isinstance(keys, dict):
+            items = [(k, float(w)) for k, w in keys.items()]
+        else:
+            items = [(k, 1.0) for k in keys]
+        agg = (aggregate or "SUM").upper()
+        if agg not in ("SUM", "MIN", "MAX"):
+            raise DataError("aggregate must be SUM, MIN, or MAX")
+        combine = {"SUM": lambda a, b: a + b, "MIN": min, "MAX": max}[agg]
+        dest_key = self._encode_key(dest)
+        now = time.time()
+        with self._write() as conn:
+            maps = []
+            for name, weight in items:
+                scores = self._zset_or_set_scores(conn, name, now)
+                if scores is None:
+                    maps.append({})
+                else:
+                    maps.append({m: s * weight for m, s in scores.items()})
+            result = {}
+            if maps:
+                if inter:
+                    members = set(maps[0])
+                    for other in maps[1:]:
+                        members &= set(other)
+                else:
+                    members = set()
+                    for m in maps:
+                        members |= set(m)
+                for member in members:
+                    scores = [m[member] for m in maps if member in m]
+                    acc = scores[0]
+                    for s in scores[1:]:
+                        acc = combine(acc, s)
+                    result[member] = acc
+            dest_row = self._lookup(conn, dest_key, now)
+            if dest_row is not None:
+                conn.execute(
+                    "DELETE FROM babyredis_keys WHERE id = ?", (dest_row[0],)
+                )
+            if result:
+                key_id = self._create_key(conn, dest_key, "zset", None)
+                for member, score in result.items():
+                    conn.execute(
+                        "INSERT INTO babyredis_zsets (key_id, member, score)"
+                        " VALUES (?, ?, ?)",
+                        (key_id, member, score),
+                    )
+        return len(result)
+
+    def zunionstore(self, dest, keys, aggregate=None):
+        return self._zstore(dest, keys, aggregate, inter=False)
+
+    def zinterstore(self, dest, keys, aggregate=None):
+        return self._zstore(dest, keys, aggregate, inter=True)
 
     def zscan(self, name, cursor=0, match=None, count=10):
         name_key = self._encode_key(name)
@@ -1483,6 +1685,48 @@ class BabyRedis:
             ).fetchone()
         return length
 
+    def lmove(self, first_list, second_list, src="LEFT", dest="RIGHT"):
+        src, dest = src.upper(), dest.upper()
+        if src not in ("LEFT", "RIGHT") or dest not in ("LEFT", "RIGHT"):
+            raise DataError("src and dest must be 'LEFT' or 'RIGHT'")
+        src_key = self._encode_key(first_list)
+        dst_key = self._encode_key(second_list)
+        now = time.time()
+        with self._write() as conn:
+            src_row = self._typed_lookup(conn, src_key, now, "list")
+            dst_row = src_row if src_key == dst_key \
+                else self._typed_lookup(conn, dst_key, now, "list")
+            if src_row is None:
+                return None
+            order = "ASC" if src == "LEFT" else "DESC"
+            pos, value = conn.execute(
+                f"SELECT pos, value FROM babyredis_lists WHERE key_id = ?"
+                f" ORDER BY pos {order} LIMIT 1",
+                (src_row[0],),
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM babyredis_lists WHERE key_id = ? AND pos = ?",
+                (src_row[0], pos),
+            )
+            dst_id = dst_row[0] if dst_row is not None else self._create_key(
+                conn, dst_key, "list", None)
+            lo, hi = self._list_bounds(conn, dst_id)
+            if dest == "LEFT":
+                new_pos = (lo if lo is not None else 0.0) - 1.0
+            else:
+                new_pos = (hi if hi is not None else 0.0) + 1.0
+            conn.execute(
+                "INSERT INTO babyredis_lists (key_id, pos, value)"
+                " VALUES (?, ?, ?)",
+                (dst_id, new_pos, bytes(value)),
+            )
+            if src_row[0] != dst_id:
+                self._drop_if_empty(conn, src_row[0], "list")
+        return self._decode(bytes(value))
+
+    def rpoplpush(self, src, dst):
+        return self.lmove(src, dst, "RIGHT", "LEFT")
+
     # -- keys -------------------------------------------------------------
 
     def delete(self, *names):
@@ -1620,6 +1864,8 @@ class BabyRedis:
             row = self._lookup(conn, src_key, now)
             if row is None:
                 raise ResponseError("no such key")
+            if src_key == dst_key:
+                return True
             dst_row = self._lookup(conn, dst_key, now)
             if dst_row is not None:
                 conn.execute(
@@ -1630,6 +1876,35 @@ class BabyRedis:
                 (dst_key, row[0]),
             )
         return True
+
+    def renamenx(self, src, dst):
+        src_key = self._encode_key(src)
+        dst_key = self._encode_key(dst)
+        now = time.time()
+        with self._write() as conn:
+            row = self._lookup(conn, src_key, now)
+            if row is None:
+                raise ResponseError("no such key")
+            if src_key == dst_key:
+                return False
+            if self._lookup(conn, dst_key, now) is not None:
+                return False
+            conn.execute(
+                "UPDATE babyredis_keys SET key = ? WHERE id = ?",
+                (dst_key, row[0]),
+            )
+        return True
+
+    def randomkey(self):
+        now = time.time()
+        with self._read() as conn:
+            got = conn.execute(
+                "SELECT key FROM babyredis_keys WHERE expires_at IS NULL"
+                " OR expires_at > ? ORDER BY RANDOM() LIMIT 1", (now,)
+            ).fetchone()
+        if got is None:
+            return None
+        return got[0] if self.decode_responses else got[0].encode("utf-8")
 
     def type(self, name):
         key = self._encode_key(name)
