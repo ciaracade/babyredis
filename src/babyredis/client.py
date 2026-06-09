@@ -893,9 +893,11 @@ class BabyRedis:
         now = time.time()
         with self._write() as conn:
             src_row = self._typed_lookup(conn, self._encode_key(src), now, "set")
-            dst_row = self._typed_lookup(conn, self._encode_key(dst), now, "set")
             if src_row is None:
+                # like Redis: missing source short-circuits before the
+                # destination type check
                 return False
+            dst_row = self._typed_lookup(conn, self._encode_key(dst), now, "set")
             cur = conn.execute(
                 "DELETE FROM babyredis_sets WHERE key_id = ? AND member = ?",
                 (src_row[0], member),
@@ -1497,7 +1499,7 @@ class BabyRedis:
         values = [self._decode(bytes(v)) for _, v in rows]
         if count is None:
             return values[0] if values else None
-        return values or None
+        return values  # count=0 on an existing key yields [], like Redis
 
     def lpop(self, name, count=None):
         return self._pop(name, count, left=True)
@@ -1694,10 +1696,11 @@ class BabyRedis:
         now = time.time()
         with self._write() as conn:
             src_row = self._typed_lookup(conn, src_key, now, "list")
+            if src_row is None:
+                # Redis returns nil without type-checking the destination
+                return None
             dst_row = src_row if src_key == dst_key \
                 else self._typed_lookup(conn, dst_key, now, "list")
-            if src_row is None:
-                return None
             order = "ASC" if src == "LEFT" else "DESC"
             pos, value = conn.execute(
                 f"SELECT pos, value FROM babyredis_lists WHERE key_id = ?"

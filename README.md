@@ -103,6 +103,11 @@ silent wrong-type reads, keeping emptied keys, refusing cross-type
 `rename`, no negative `zrange` indices — babyredis follows **Redis**, and
 each divergence is noted in the test.
 
+On top of that, `tests/test_oracle.py` runs property-based tests with
+[fakeredis](https://github.com/cunla/fakeredis-py) as the oracle: a
+Hypothesis state machine fires random command sequences at both clients
+and asserts identical results (or identical failures) after every step.
+
 ## Testing
 
 babyredis doubles as a Redis stand-in for tests. Opt into the bundled
@@ -126,12 +131,12 @@ pip install babyredis
 
 - Published benchmarks vs Redis and fakeredis
 - `redis.asyncio`-shaped async client
-- Property-based compatibility tests against fakeredis
 - Type hints + `py.typed`
 
 ## Development
 
 ```sh
-pip install -e . pytest
+pip install -e .
+pip install pytest hypothesis fakeredis
 pytest tests/
 ```
