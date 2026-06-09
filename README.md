@@ -84,6 +84,31 @@ the key, and TTLs apply per key across all types. Expired keys are
 invisible immediately and physically purged lazily, with a periodic sweep
 on writes.
 
+## Async
+
+`babyredis.aio` mirrors `redis.asyncio`: same constructor, every command
+awaitable, `*_iter` helpers are async generators. Commands run in a
+worker thread so the event loop never blocks on SQLite I/O.
+
+```python
+from babyredis.aio import Redis
+
+async with Redis("cache.db") as r:
+    await r.set("k", "v", ex=60)
+    await r.get("k")
+    async for key in r.scan_iter(match="user:*"):
+        ...
+```
+
+## Performance
+
+Single-operation latency beats Redis-over-loopback ~6-10x (no TCP round
+trip) and fakeredis ~5x; a plain dict beats everything by ~40x; Redis
+wins back parity with pipelining and wins outright on concurrent write
+throughput. Full table, methodology, and honest caveats in
+[docs/performance.md](docs/performance.md). Reproduce with
+`python benchmarks/bench.py`.
+
 ## Concurrency
 
 File-backed databases use one SQLite connection per thread: reads take no
@@ -129,8 +154,6 @@ pip install babyredis
 
 ## Roadmap
 
-- Published benchmarks vs Redis and fakeredis
-- `redis.asyncio`-shaped async client
 - Type hints + `py.typed`
 
 ## Development
