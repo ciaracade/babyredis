@@ -1,11 +1,11 @@
 [project]
 name = "babyredis"
-version = "0.0.1"
+version = "0.5.0"
 authors = [
   { name="Ciara Cade", email="contact@ciaracade.com" },
 ]
-description = "Redis interface for SQLite."
-requires-python = ">=3.8"
+description = "Redis-like commands backed by SQLite. No server to run."
+requires-python = ">=3.9"
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3",
